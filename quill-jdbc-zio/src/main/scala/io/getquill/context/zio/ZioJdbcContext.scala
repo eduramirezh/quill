@@ -1,21 +1,18 @@
-package io.getquill.context.monix
+package io.getquill.context.zio
 
 import java.io.Closeable
 import java.sql.{Array => _, _}
 
-import cats.effect.ExitCase
 import io.getquill.{NamingStrategy, Query, ReturnAction}
-import io.getquill.context.ContextEffect
-import io.getquill.context.StreamingContext
+import io.getquill.context.{ContextEffect, StreamingContext}
 import io.getquill.context.jdbc.JdbcContextBase
-import io.getquill.context.monix.MonixJdbcContext.Runner
 import io.getquill.context.sql.idiom.SqlIdiom
+import io.getquill.context.zio.{Runner, ZioContext, ZioTranslateContext}
 import io.getquill.util.ContextLogger
 import javax.sql.DataSource
-import monix.eval.{Task, TaskLocal}
-import monix.execution.Scheduler
-import monix.execution.misc.Local
-import monix.reactive.Observable
+import zio.Exit.{Failure, Success}
+import zio.{FiberRef, Task, UIO}
+import zio.stream.Stream
 
 import scala.util.Try
 
@@ -23,25 +20,25 @@ import scala.util.Try
  * Quill context that wraps all JDBC calls in `monix.eval.Task`.
  *
  */
-abstract class MonixJdbcContext[Dialect <: SqlIdiom, Naming <: NamingStrategy](
-  dataSource: DataSource with Closeable,
-  runner:     Runner
-) extends MonixContext[Dialect, Naming]
+abstract class ZioJdbcContext[Dialect <: SqlIdiom, Naming <: NamingStrategy](
+  dataSource: DataSource with Closeable, runner: Runner
+) extends ZioContext[Dialect, Naming]
   with JdbcContextBase[Dialect, Naming]
   with StreamingContext[Dialect, Naming]
-  with MonixTranslateContext {
+  with ZioTranslateContext {
 
-  override private[getquill] val logger = ContextLogger(classOf[MonixJdbcContext[_, _]])
+  override private[getquill] val logger = ContextLogger(classOf[ZioJdbcContext[_, _]])
+
+  override def prepareSingle(sql: String, prepare: Prepare): Connection => Task[PreparedStatement] = super.prepareSingle(sql, prepare)
 
   override type PrepareRow = PreparedStatement
   override type ResultRow = ResultSet
   override type RunActionResult = Long
   override type RunActionReturningResult[T] = T
   override type RunBatchActionResult = List[Long]
-
-  override def prepare[T](quoted: Quoted[Query[T]]): Connection => Task[PreparedStatement] = super.prepare(quoted)
-
   override type RunBatchActionReturningResult[T] = List[T]
+
+  override def prepare[T](quoted: Quoted[Query[T]]): Connection => Result[PreparedStatement] = super.prepare(quoted)
 
   // Need explicit return-type annotations due to scala/bug#8356. Otherwise macro system will not understand Result[Long]=Task[Long] etc...
   override def executeAction[T](sql: String, prepare: Prepare = identityPrepare): Task[Long] =
@@ -64,35 +61,38 @@ abstract class MonixJdbcContext[Dialect <: SqlIdiom, Naming <: NamingStrategy](
     super.prepareBatchAction(groups)
 
   override protected val effect: Runner = runner
-  import runner._
+  import effect._
 
-  private val currentConnection: Local[Option[Connection]] = Local(None)
+  private val currentConnection: UIO[FiberRef[Option[Connection]]] = FiberRef.make(None)
 
   override def close(): Unit = dataSource.close()
 
   override protected def withConnection[T](f: Connection => Task[T]): Task[T] =
     for {
-      maybeConnection <- wrap { currentConnection() }
+      maybeConnectionRef <- currentConnection
+      maybeConnection <- maybeConnectionRef.get
       result <- maybeConnection match {
         case Some(connection) => f(connection)
         case None =>
           schedule {
-            wrap(dataSource.getConnection).bracket(f)(conn => wrapClose(conn.close()))
+            wrap(dataSource.getConnection).bracket(conn => wrapClose(conn.close()))(f)
           }
       }
     } yield result
 
-  protected def withConnectionObservable[T](f: Connection => Observable[T]): Observable[T] =
+  protected def withConnectionObservable[T](f: Connection => Stream[Throwable, T]): Stream[Throwable, T] =
     for {
-      maybeConnection <- Observable.eval(currentConnection())
+      maybeConnectionRef <- Stream.fromEffect(currentConnection)
+      maybeConnection <- Stream.fromEffect(maybeConnectionRef.get)
       result <- maybeConnection match {
         case Some(connection) =>
           withAutocommitBracket(connection, f)
         case None =>
-          scheduleObservable {
-            Observable.eval(dataSource.getConnection)
-              .bracket(conn => withAutocommitBracket(conn, f))(conn => wrapClose(conn.close()))
-          }
+          Stream.bracket(
+            Task(dataSource.getConnection)
+          )(conn => wrapClose(conn.close())).flatMap(conn => // Note: Can use mapM instead
+            withAutocommitBracket(conn, f)
+          )
       }
     } yield result
 
@@ -100,24 +100,24 @@ abstract class MonixJdbcContext[Dialect <: SqlIdiom, Naming <: NamingStrategy](
    * Need to store, set and restore the client's autocommit mode since some vendors (e.g. postgres)
    * don't like autocommit=true during streaming sessions. Using brackets to do that.
    */
-  private[getquill] def withAutocommitBracket[T](conn: Connection, f: Connection => Observable[T]): Observable[T] = {
-    Observable.eval(autocommitOff(conn))
-      .bracket({ case (conn, _) => f(conn) })(autoCommitBackOn)
+  private[getquill] def withAutocommitBracket[T](conn: Connection, f: Connection => Stream[Throwable, T]): Stream[Throwable, T] = {
+    Stream.bracket(Task(autocommitOff(conn)))(autoCommitBackOn)
+      .flatMap({ case (conn, _) => f(conn) })
   }
 
   private[getquill] def withAutocommitBracket[T](conn: Connection, f: Connection => Task[T]): Task[T] = {
     Task(autocommitOff(conn))
-      .bracket({ case (conn, _) => f(conn) })(autoCommitBackOn)
+      .bracket(autoCommitBackOn)({ case (conn, _) => f(conn) })
   }
 
   private[getquill] def withCloseBracket[T](conn: Connection, f: Connection => Task[T]): Task[T] = {
     Task(conn)
-      .bracket(conn => f(conn))(conn => wrapClose(conn.close()))
+      .bracket(conn => wrapClose(conn.close()))(conn => f(conn))
   }
 
   private[getquill] def autocommitOff(conn: Connection): (Connection, Boolean) = {
-    val ac = conn.getAutoCommit
-    conn.setAutoCommit(false)
+    val ac = conn.getAutoCommit;
+    conn.setAutoCommit(false);
     (conn, ac)
   }
 
@@ -126,37 +126,38 @@ abstract class MonixJdbcContext[Dialect <: SqlIdiom, Naming <: NamingStrategy](
     wrapClose(conn.setAutoCommit(wasAutocommit))
   }
 
-  def transaction[A](f: Task[A]): Task[A] = effect.boundary {
-    Task.suspend(
-      // Local read is side-effecting, need suspend
-      currentConnection().map(_ => f).getOrElse {
-        effect.wrap {
-          val c = dataSource.getConnection()
-          c.setAutoCommit(false)
-          c
-        }.bracket { conn =>
-          TaskLocal.wrap(Task.pure(currentConnection))
-            .flatMap { tl =>
-              // set local for the tightest scope possible, and commit/rollback/close
-              // only when nobody can touch the connection anymore
-              // also, TaskLocal.bind is more hygienic then manual set/unset
-              tl.bind(Some(conn))(f).guaranteeCase {
-                case ExitCase.Completed => effect.wrap(conn.commit())
-                case ExitCase.Error(e) => effect.wrap {
-                  conn.rollback()
-                  throw e
+  def transaction[A](f: Task[A]): Task[A] = {
+    val dbEffects = for {
+      connectionRef <- currentConnection
+      connection <- connectionRef.get
+      result <- connection match {
+        case Some(_) => f // Already in a transaction
+        case None =>
+          wrap(dataSource.getConnection).bracket { conn =>
+            wrapClose(connectionRef.set(None))
+          } { conn =>
+            withCloseBracket(conn, conn => {
+              withAutocommitBracket(conn, conn => {
+                wrap(conn).flatMap { conn =>
+                  connectionRef.set(Some(conn))
+                  f.onInterrupt(Task.die(new IllegalStateException(
+                    "The task was cancelled in the middle of a transaction."
+                  ))).onExit {
+                    case Success(_) =>
+                      wrapClose(conn.commit())
+                    case Failure(cause) =>
+                      wrapClose(conn.rollback()) *> Task.halt(cause)
+                  }
                 }
-                case ExitCase.Canceled => effect.wrap(conn.rollback())
-              }
-            }
-        } { conn =>
-          effect.wrapClose {
-            conn.setAutoCommit(true) // Do we need this if we're closing anyway?
-            conn.close()
+              })
+            })
           }
-        }
       }
-    ).executeWithOptions(_.enableLocalContextPropagation)
+    } yield result
+
+    boundary {
+      schedule(dbEffects)
+    }
   }
 
   // Override with sync implementation so will actually be able to do it.
@@ -174,17 +175,13 @@ abstract class MonixJdbcContext[Dialect <: SqlIdiom, Naming <: NamingStrategy](
    * Since Quill provides a extractor for an individual ResultSet row, a single row can easily be cached
    * in memory. This allows for a straightforward implementation of a hasNext method.
    */
-  class ResultSetIterator[T](rs: ResultSet, extractor: Extractor[T]) extends collection.BufferedIterator[T] {
+  class ResultSetIterator[T](rs: ResultSet, extractor: Extractor[T]) extends BufferedIterator[T] {
 
-    private final val NoData = 0
-    private final val Cached = 1
-    private final val Finished = 2
-
-    private[this] var state = NoData
+    private[this] var state = 0 // 0: no data, 1: cached, 2: finished
     private[this] var cached: T = null.asInstanceOf[T]
 
     protected[this] final def finished(): T = {
-      state = Finished
+      state = 2
       null.asInstanceOf[T]
     }
 
@@ -200,23 +197,23 @@ abstract class MonixJdbcContext[Dialect <: SqlIdiom, Naming <: NamingStrategy](
     }
 
     private def prefetchIfNeeded(): Unit = {
-      if (state == NoData) {
+      if (state == 0) {
         cached = fetchNext()
-        if (state == NoData) state = Cached
+        if (state == 0) state = 1
       }
     }
 
     def hasNext: Boolean = {
       prefetchIfNeeded()
-      state == Cached
+      state == 1
     }
 
     def next(): T = {
       prefetchIfNeeded()
-      if (state == Cached) {
-        state = NoData
+      if (state == 1) {
+        state = 0
         cached
-      } else throw new NoSuchElementException("next on empty iterator")
+      } else throw new NoSuchElementException("next on empty iterator");
     }
   }
 
@@ -231,18 +228,20 @@ abstract class MonixJdbcContext[Dialect <: SqlIdiom, Naming <: NamingStrategy](
     stmt
   }
 
-  def streamQuery[T](fetchSize: Option[Int], sql: String, prepare: Prepare = identityPrepare, extractor: Extractor[T] = identityExtractor): Observable[T] =
+  def streamQuery[T](fetchSize: Option[Int], sql: String, prepare: Prepare = identityPrepare, extractor: Extractor[T] = identityExtractor): Stream[Throwable, T] =
     withConnectionObservable { conn =>
-      Observable.eval {
-        val stmt = prepareStatementForStreaming(sql, conn, fetchSize)
-        val (params, ps) = prepare(stmt)
-        logger.logQuery(sql, params)
-        ps.executeQuery()
-      }.bracket { rs =>
-        Observable
-          .fromIteratorUnsafe(new ResultSetIterator(rs, extractor))
-      } { rs =>
+      Stream.bracket({
+        Task {
+          val stmt = prepareStatementForStreaming(sql, conn, fetchSize)
+          val (params, ps) = prepare(stmt)
+          logger.logQuery(sql, params)
+          ps.executeQuery()
+        }
+      })({ rs =>
         wrapClose(rs.close())
+      }).flatMap { rs =>
+        Stream
+          .fromIterator(new ResultSetIterator(rs, extractor))
       }
     }
 
@@ -250,32 +249,5 @@ abstract class MonixJdbcContext[Dialect <: SqlIdiom, Naming <: NamingStrategy](
     withConnectionWrapped { conn =>
       prepare(conn.prepareStatement(statement))._1.reverse.map(prepareParam)
     }
-  }
-}
-
-object MonixJdbcContext {
-  object Runner {
-    def default = new Runner {}
-    def using(scheduler: Scheduler) = new Runner {
-      override def schedule[T](t: Task[T]): Task[T] = t.executeOn(scheduler, true)
-      override def boundary[T](t: Task[T]): Task[T] = t.executeOn(scheduler, true)
-      override def scheduleObservable[T](o: Observable[T]): Observable[T] = o.executeOn(scheduler, true)
-    }
-  }
-
-  trait Runner extends ContextEffect[Task] {
-    override def wrap[T](t: => T): Task[T] = Task(t)
-    override def push[A, B](result: Task[A])(f: A => B): Task[B] = result.map(f)
-    override def seq[A](list: List[Task[A]]): Task[List[A]] = Task.sequence(list)
-    def schedule[T](t: Task[T]): Task[T] = t
-    def scheduleObservable[T](o: Observable[T]): Observable[T] = o
-    def boundary[T](t: Task[T]): Task[T] = t.asyncBoundary
-
-    /**
-     * Use this method whenever a ResultSet is being wrapped. This has a distinct
-     * method because the client may prefer to fail silently on a ResultSet close
-     * as opposed to failing the surrounding task.
-     */
-    def wrapClose(t: => Unit): Task[Unit] = Task(t)
   }
 }
