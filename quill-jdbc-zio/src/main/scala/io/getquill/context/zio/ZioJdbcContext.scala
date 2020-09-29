@@ -1,17 +1,16 @@
 package io.getquill.context.zio
 
 import java.io.Closeable
-import java.sql.{Array => _, _}
+import java.sql.{ Array => _, _ }
 
-import io.getquill.{NamingStrategy, Query, ReturnAction}
-import io.getquill.context.{ContextEffect, StreamingContext}
+import io.getquill.{ NamingStrategy, ReturnAction }
+import io.getquill.context.StreamingContext
 import io.getquill.context.jdbc.JdbcContextBase
 import io.getquill.context.sql.idiom.SqlIdiom
-import io.getquill.context.zio.{Runner, ZioContext, ZioTranslateContext}
 import io.getquill.util.ContextLogger
 import javax.sql.DataSource
-import zio.Exit.{Failure, Success}
-import zio.{FiberRef, Task, UIO}
+import zio.Exit.{ Failure, Success }
+import zio.{ FiberRef, Task, UIO }
 import zio.stream.Stream
 
 import scala.util.Try
@@ -37,8 +36,6 @@ abstract class ZioJdbcContext[Dialect <: SqlIdiom, Naming <: NamingStrategy](
   override type RunActionReturningResult[T] = T
   override type RunBatchActionResult = List[Long]
   override type RunBatchActionReturningResult[T] = List[T]
-
-  override def prepare[T](quoted: Quoted[Query[T]]): Connection => Result[PreparedStatement] = super.prepare(quoted)
 
   // Need explicit return-type annotations due to scala/bug#8356. Otherwise macro system will not understand Result[Long]=Task[Long] etc...
   override def executeAction[T](sql: String, prepare: Prepare = identityPrepare): Task[Long] =
@@ -91,8 +88,7 @@ abstract class ZioJdbcContext[Dialect <: SqlIdiom, Naming <: NamingStrategy](
           Stream.bracket(
             Task(dataSource.getConnection)
           )(conn => wrapClose(conn.close())).flatMap(conn => // Note: Can use mapM instead
-            withAutocommitBracket(conn, f)
-          )
+              withAutocommitBracket(conn, f))
       }
     } yield result
 
@@ -134,7 +130,8 @@ abstract class ZioJdbcContext[Dialect <: SqlIdiom, Naming <: NamingStrategy](
         case Some(_) => f // Already in a transaction
         case None =>
           wrap(dataSource.getConnection).bracket { conn =>
-            wrapClose(connectionRef.set(None))
+            // TODO This returns UIO, is that correct?
+            connectionRef.set(None)
           } { conn =>
             withCloseBracket(conn, conn => {
               withAutocommitBracket(conn, conn => {
@@ -146,7 +143,8 @@ abstract class ZioJdbcContext[Dialect <: SqlIdiom, Naming <: NamingStrategy](
                     case Success(_) =>
                       wrapClose(conn.commit())
                     case Failure(cause) =>
-                      wrapClose(conn.rollback()) *> Task.halt(cause)
+                      // TODO Are we really catching the result of the conn.rollback() Task's exception?
+                      catchAll(Task(conn.rollback()) *> Task.halt(cause))
                   }
                 }
               })

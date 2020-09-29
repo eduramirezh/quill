@@ -1,10 +1,10 @@
 package io.getquill.context.monix
 
 import java.io.Closeable
-import java.sql.{Array => _, _}
+import java.sql.{ Array => _, _ }
 
 import cats.effect.ExitCase
-import io.getquill.{NamingStrategy, Query, ReturnAction}
+import io.getquill.{ NamingStrategy, ReturnAction }
 import io.getquill.context.ContextEffect
 import io.getquill.context.StreamingContext
 import io.getquill.context.jdbc.JdbcContextBase
@@ -12,7 +12,7 @@ import io.getquill.context.monix.MonixJdbcContext.Runner
 import io.getquill.context.sql.idiom.SqlIdiom
 import io.getquill.util.ContextLogger
 import javax.sql.DataSource
-import monix.eval.{Task, TaskLocal}
+import monix.eval.{ Task, TaskLocal }
 import monix.execution.Scheduler
 import monix.execution.misc.Local
 import monix.reactive.Observable
@@ -38,9 +38,6 @@ abstract class MonixJdbcContext[Dialect <: SqlIdiom, Naming <: NamingStrategy](
   override type RunActionResult = Long
   override type RunActionReturningResult[T] = T
   override type RunBatchActionResult = List[Long]
-
-  override def prepare[T](quoted: Quoted[Query[T]]): Connection => Task[PreparedStatement] = super.prepare(quoted)
-
   override type RunBatchActionReturningResult[T] = List[T]
 
   // Need explicit return-type annotations due to scala/bug#8356. Otherwise macro system will not understand Result[Long]=Task[Long] etc...

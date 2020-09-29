@@ -34,8 +34,6 @@ trait JdbcContextBase[Dialect <: SqlIdiom, Naming <: NamingStrategy]
       ps.executeUpdate().toLong
     }
 
-  override def prepare[T](quoted: Quoted[Query[T]]): Connection => Result[PreparedStatement] = super.prepare(quoted)
-
   def executeQuery[T](sql: String, prepare: Prepare = identityPrepare, extractor: Extractor[T] = identityExtractor): Result[List[T]] =
     withConnectionWrapped { conn =>
       val (params, ps) = prepare(conn.prepareStatement(sql))
