@@ -1,18 +1,19 @@
 package io.getquill.context.zio
 
 import java.io.Closeable
-import java.sql.{ Array => _, _ }
+import java.sql.{Array => _, _}
 
-import io.getquill.{ NamingStrategy, ReturnAction }
+import io.getquill.{NamingStrategy, ReturnAction}
 import io.getquill.context.StreamingContext
 import io.getquill.context.jdbc.JdbcContextBase
 import io.getquill.context.sql.idiom.SqlIdiom
 import io.getquill.util.ContextLogger
 import javax.sql.DataSource
-import zio.Exit.{ Failure, Success }
-import zio.{ FiberRef, Task, UIO }
-import zio.stream.Stream
+import zio.Exit.{Failure, Success}
+import zio.{Chunk, FiberRef, Task, UIO, ZIO}
+import zio.stream.{Stream, ZStream}
 
+import scala.collection.mutable
 import scala.util.Try
 
 /**
@@ -238,10 +239,45 @@ abstract class ZioJdbcContext[Dialect <: SqlIdiom, Naming <: NamingStrategy](
       })({ rs =>
         wrapClose(rs.close())
       }).flatMap { rs =>
-        Stream
-          .fromIterator(new ResultSetIterator(rs, extractor))
+        val iter = new ResultSetIterator(rs, extractor)
+        fetchSize match {
+          // TODO Assuming chunk size is fetch size. Not sure if this is optimal. Maybe introduce some switches to control this?
+          case Some(size) =>
+            chunkedFetch(iter, size)
+          case None =>
+            Stream.fromIterator(new ResultSetIterator(rs, extractor))
+        }
       }
     }
+
+  def chunkedFetch[T](iter: ResultSetIterator[T], fetchSize: Int) = {
+    object StreamEnd extends Throwable
+    ZStream.fromEffect(Task(iter) <*> ZIO.runtime[Any]).flatMap {
+      case (it, rt) =>
+        ZStream.repeatEffectChunkOption {
+          Task {
+            val hasNext: Boolean =
+              try it.hasNext
+              catch {
+                case e: Throwable if !rt.platform.fatal(e) =>
+                  throw e
+              }
+            if (hasNext) {
+              try {
+                val arr = it.take(fetchSize).toArray
+                Chunk.fromArray(arr)
+              } catch {
+                case e: Throwable if !rt.platform.fatal(e) =>
+                  throw e
+              }
+            } else throw StreamEnd
+          }.mapError {
+            case StreamEnd => None
+            case e         => Some(e)
+          }
+        }
+    }
+  }
 
   override private[getquill] def prepareParams(statement: String, prepare: Prepare): Task[Seq[String]] = {
     withConnectionWrapped { conn =>
